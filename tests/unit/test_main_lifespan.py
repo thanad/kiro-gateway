@@ -43,6 +43,7 @@ class TestLifespanLegacyFallback:
         
         # Arrange: Patch constants directly in main module (not os.environ)
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", False)
+        monkeypatch.setattr("main.KIRO_API_KEY", "")
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:123456789:profile/test")
         monkeypatch.setattr("main.REGION", "us-east-1")
@@ -186,6 +187,7 @@ class TestLifespanLegacyFallback:
         
         # Patch constants directly
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
+        monkeypatch.setattr("main.KIRO_API_KEY", "")
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", str(sqlite_db))
         monkeypatch.setattr("main.KIRO_CREDS_FILE", str(json_file))
