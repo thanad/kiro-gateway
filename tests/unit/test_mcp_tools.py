@@ -250,6 +250,99 @@ class TestCallKiroMCPAPI:
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
         assert tool_use_id is None
         assert results is None
+    
+    @pytest.mark.asyncio
+    async def test_mcp_api_sends_tokentype_header_for_api_key_auth(self):
+        """
+        What it does: Verifies tokentype: API_KEY header is sent when using API key auth.
+        Purpose: Ensure MCP calls work correctly with API key authentication (fixes 400 error).
+        """
+        print("Setup: Creating auth_manager with API_KEY auth type...")
+        from kiro.auth import KiroAuthManager, AuthType
+        
+        auth_manager = KiroAuthManager(api_key="test_api_key_abc123")
+        
+        mock_response_data = {
+            "id": "web_search_tooluse_test",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "results": [],
+                        "totalResults": 0,
+                        "query": "test"
+                    })
+                }],
+                "isError": False
+            }
+        }
+        
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+        
+        captured_headers = {}
+        
+        async def capture_post(url, json=None, headers=None, **kwargs):
+            captured_headers.update(headers or {})
+            return mock_response
+        
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = capture_post
+        
+        print("Action: Calling call_kiro_mcp_api with API_KEY auth...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test", auth_manager)
+        
+        print(f"Captured headers: {captured_headers}")
+        assert "tokentype" in captured_headers, "tokentype header must be present for API_KEY auth"
+        assert captured_headers["tokentype"] == "API_KEY"
+    
+    @pytest.mark.asyncio
+    async def test_mcp_api_no_tokentype_header_for_non_api_key_auth(self, mock_auth_manager):
+        """
+        What it does: Verifies tokentype header is NOT sent for non-API-key auth.
+        Purpose: Ensure header is only added when needed (regression test).
+        """
+        print("Setup: Using standard KiroDesktop auth manager (no API key)...")
+        from kiro.auth import AuthType
+        
+        mock_response_data = {
+            "id": "web_search_tooluse_test",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "results": [],
+                        "totalResults": 0,
+                        "query": "test"
+                    })
+                }],
+                "isError": False
+            }
+        }
+        
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+        
+        captured_headers = {}
+        
+        async def capture_post(url, json=None, headers=None, **kwargs):
+            captured_headers.update(headers or {})
+            return mock_response
+        
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = capture_post
+        
+        print("Action: Calling call_kiro_mcp_api with standard auth...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test", mock_auth_manager)
+        
+        print(f"Captured headers: {captured_headers}")
+        assert "tokentype" not in captured_headers, "tokentype header must NOT be present for non-API-key auth"
 
 
 # ==================================================================================================
