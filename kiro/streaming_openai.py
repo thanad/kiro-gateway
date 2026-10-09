@@ -432,6 +432,34 @@ async def stream_kiro_to_openai_internal(
             f"Error during streaming: [{error_type}] {error_msg}",
             exc_info=True
         )
+        # If content was already streamed to the client, the OpenAI stream must
+        # still terminate with a finish_reason chunk. Without it, clients treat
+        # the stream as "ended without finish_reason" and blindly retry the whole
+        # request, even though partial content was already delivered. Emitting a
+        # terminal chunk lets the client close the stream cleanly.
+        #
+        # We use "stop" rather than "length": OpenAI's finish_reason has no value
+        # for "upstream connection broke mid-stream", and "length" would signal a
+        # token-limit truncation that invites continuation. "stop" terminates the
+        # stream without implying the response should be resumed. The underlying
+        # error is still logged server-side and propagated below.
+        #
+        # When no content was sent yet (first_chunk is True), we do NOT fabricate
+        # a terminal chunk: the error should propagate so normal error handling
+        # (HTTP error, first-token retry) applies instead of a fake empty success.
+        if not first_chunk:
+            error_finish_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            try:
+                yield f"data: {json.dumps(error_finish_chunk, ensure_ascii=False)}\n\n"
+            except Exception:
+                # Client already disconnected - nothing more we can send
+                pass
         # Propagate error up for proper handling in routes_openai.py
         raise
     finally:

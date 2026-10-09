@@ -973,6 +973,119 @@ class TestStreamingAnthropicErrorHandling:
         print("Check: response.aclose() should be called...")
         mock_response.aclose.assert_called()
         print("✓ Response closed in finally block")
+    
+    @pytest.mark.asyncio
+    async def test_closes_open_text_block_before_error_event(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Closes an open text content block before emitting the error
+            event when an error occurs mid-stream.
+        Goal: Anthropic clients expect a content_block_stop for every open
+            content_block_start. Leaving a block unclosed makes the client treat
+            the stream as incomplete and retry blindly, discarding received content.
+        """
+        print("Setup: Mock stream that opens a text block then raises...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            raise RuntimeError("Upstream connection broke")
+        
+        print("Action: Streaming and collecting events until error...")
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                try:
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+                except RuntimeError:
+                    pass
+        
+        print(f"Received {len(events)} events")
+        
+        # Find the index of content_block_stop and the error event
+        stop_indices = [i for i, e in enumerate(events) if "content_block_stop" in e]
+        error_indices = [i for i, e in enumerate(events) if "event: error" in e]
+        
+        assert len(stop_indices) >= 1, "Expected a content_block_stop before error"
+        assert len(error_indices) >= 1, "Expected an error event"
+        # content_block_stop must come BEFORE the error event
+        assert stop_indices[-1] < error_indices[0]
+        print("✓ Open text block closed before error event")
+    
+    @pytest.mark.asyncio
+    async def test_closes_open_thinking_block_before_error_event(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Closes an open thinking content block before the error event.
+        Goal: Verify thinking blocks are also finalized on mid-stream error so the
+            client's block tracking stays consistent.
+        """
+        print("Setup: Mock stream that opens a thinking block then raises...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Reasoning...")
+            raise RuntimeError("Broke after thinking")
+        
+        print("Action: Streaming with reasoning mode until error...")
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    try:
+                        async for event in stream_kiro_to_anthropic(
+                            mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                        ):
+                            events.append(event)
+                    except RuntimeError:
+                        pass
+        
+        print(f"Received {len(events)} events")
+        
+        stop_indices = [i for i, e in enumerate(events) if "content_block_stop" in e]
+        error_indices = [i for i, e in enumerate(events) if "event: error" in e]
+        
+        assert len(stop_indices) >= 1, "Expected a content_block_stop before error"
+        assert len(error_indices) >= 1, "Expected an error event"
+        assert stop_indices[-1] < error_indices[0]
+        print("✓ Open thinking block closed before error event")
+    
+    @pytest.mark.asyncio
+    async def test_no_content_block_stop_when_no_block_open(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Does not emit a stray content_block_stop when no content
+            block was open at the time of the error.
+        Goal: Verify we only close blocks that were actually started, avoiding
+            malformed SSE with an unmatched content_block_stop.
+        """
+        print("Setup: Mock stream that raises before any content block opens...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            raise RuntimeError("Failed before first token")
+            yield  # Make it a generator
+        
+        print("Action: Streaming until error...")
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                try:
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+                except RuntimeError:
+                    pass
+        
+        print(f"Received {len(events)} events")
+        
+        # Only message_start and error event should be present - no content_block_stop
+        content_block_stops = [e for e in events if "content_block_stop" in e]
+        error_events = [e for e in events if "event: error" in e]
+        assert len(content_block_stops) == 0
+        assert len(error_events) >= 1
+        print("✓ No stray content_block_stop emitted when no block was open")
 
 
 # ==================================================================================================

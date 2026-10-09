@@ -702,14 +702,37 @@ async def stream_kiro_to_anthropic(
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
         
-        # Send error event
-        yield format_sse_event("error", {
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": f"Internal error: {error_msg}"
-            }
-        })
+        # Close any content blocks that are still open before emitting the error.
+        # Anthropic clients track open content blocks and expect a matching
+        # content_block_stop for every content_block_start. If the upstream
+        # connection breaks mid-block, leaving a block unclosed makes the client
+        # treat the stream as incomplete and retry blindly, discarding content it
+        # already received. Closing open blocks lets the client finalize cleanly.
+        try:
+            if thinking_block_started and thinking_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": thinking_block_index
+                })
+                thinking_block_started = False
+            if text_block_started and text_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": text_block_index
+                })
+                text_block_started = False
+            
+            # Send error event (Anthropic's documented terminal event for errors)
+            yield format_sse_event("error", {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"Internal error: {error_msg}"
+                }
+            })
+        except Exception:
+            # Client already disconnected - nothing more we can send
+            pass
         raise
     finally:
         try:
