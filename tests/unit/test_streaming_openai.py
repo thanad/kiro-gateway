@@ -1234,6 +1234,109 @@ class TestStreamingOpenaiErrorHandling:
         print(f"Caught exception: {exc_info.value}")
         assert "Original error" in str(exc_info.value)
         print("✓ Original error not masked by aclose error")
+    
+    @pytest.mark.asyncio
+    async def test_emits_finish_reason_chunk_on_error_after_content(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Emits a terminal finish_reason chunk before raising when
+            an error occurs after content was already streamed.
+        Goal: Prevent clients from seeing "stream ended without finish_reason"
+            and blindly retrying when partial content was already delivered.
+        """
+        print("Setup: Mock stream that yields content then raises mid-stream...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            raise RuntimeError("Upstream connection broke")
+        
+        print("Action: Streaming and collecting chunks until error...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(RuntimeError):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+        
+        print(f"Received {len(chunks)} chunks before error propagated")
+        
+        # Last chunk before the exception must be a terminal finish_reason chunk
+        assert len(chunks) >= 2  # content chunk + terminal chunk
+        terminal_chunk = chunks[-1]
+        assert terminal_chunk.startswith("data: ")
+        data = json.loads(terminal_chunk[len("data: "):].strip())
+        assert data["choices"][0]["finish_reason"] == "stop"
+        assert data["choices"][0]["delta"] == {}
+        print("✓ Terminal finish_reason chunk emitted on mid-stream error")
+    
+    @pytest.mark.asyncio
+    async def test_no_finish_reason_chunk_when_error_before_content(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Does NOT fabricate a terminal chunk when the error happens
+            before any content was streamed.
+        Goal: Errors before first token must propagate cleanly so normal error
+            handling (HTTP error, first-token retry) applies, not a fake success.
+        """
+        print("Setup: Mock stream that raises before yielding any content...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            raise RuntimeError("Failed before first token")
+            yield  # Make it a generator
+        
+        print("Action: Streaming and collecting chunks until error...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(RuntimeError):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+        
+        print(f"Received {len(chunks)} chunks before error propagated")
+        
+        # No chunks at all should have been emitted - no fabricated terminal chunk
+        assert chunks == []
+        print("✓ No terminal chunk fabricated when error precedes first token")
+    
+    @pytest.mark.asyncio
+    async def test_finish_reason_chunk_also_emitted_after_thinking(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Emits terminal finish_reason chunk when error occurs after
+            only thinking content was streamed (no regular content yet).
+        Goal: Thinking content also sets first_chunk=False, so the terminal chunk
+            must be emitted to close the stream cleanly.
+        """
+        print("Setup: Mock stream that yields thinking then raises...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Reasoning...")
+            raise RuntimeError("Broke after thinking")
+        
+        print("Action: Streaming and collecting chunks until error...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_openai.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    with pytest.raises(RuntimeError):
+                        async for chunk in stream_kiro_to_openai(
+                            mock_http_client, mock_response, "claude-sonnet-4",
+                            mock_model_cache, mock_auth_manager
+                        ):
+                            chunks.append(chunk)
+        
+        print(f"Received {len(chunks)} chunks before error propagated")
+        
+        terminal_chunk = chunks[-1]
+        data = json.loads(terminal_chunk[len("data: "):].strip())
+        assert data["choices"][0]["finish_reason"] == "stop"
+        print("✓ Terminal chunk emitted after thinking-only content")
 
 
 # ==================================================================================================
