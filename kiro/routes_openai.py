@@ -48,7 +48,12 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
-from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
+from kiro.streaming_openai import (
+    stream_kiro_to_openai,
+    collect_stream_response,
+    stream_with_first_token_retry,
+    build_error_termination_chunks,
+)
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
@@ -694,13 +699,23 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
+                    # The StreamingResponse has already sent HTTP 200, so we cannot
+                    # raise here: the ASGI server would fail with "response already
+                    # started" and the client would see the stream close without a
+                    # finish_reason, then blindly retry. Instead, terminate the SSE
+                    # stream cleanly with an error chunk + finish_reason + [DONE].
+                    # This covers errors from the generator AND errors raised by the
+                    # core retry loop (e.g. first-token retry exhaustion / 504).
+                    detail = e.detail if isinstance(e, HTTPException) else str(e)
+                    error_message = detail if detail else "Upstream request failed"
                     try:
-                        yield "data: [DONE]\n\n"
+                        for termination_chunk in build_error_termination_chunks(
+                            request_data.model, error_message
+                        ):
+                            yield termination_chunk
                     except Exception:
                         pass  # Client already disconnected
-                    raise
+                    # Do NOT re-raise: the stream was terminated gracefully above.
                 finally:
                     await http_client.close()
                     # Log access log for streaming (success or error)

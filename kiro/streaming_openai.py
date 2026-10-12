@@ -66,7 +66,68 @@ except ImportError:
 
 
 # Re-export FirstTokenTimeoutError for backward compatibility
-__all__ = ['FirstTokenTimeoutError', 'stream_kiro_to_openai', 'stream_with_first_token_retry', 'collect_stream_response']
+__all__ = [
+    'FirstTokenTimeoutError',
+    'stream_kiro_to_openai',
+    'stream_with_first_token_retry',
+    'collect_stream_response',
+    'build_error_termination_chunks',
+]
+
+
+def build_error_termination_chunks(model: str, error_message: str) -> list[str]:
+    """
+    Build the SSE chunks that cleanly terminate an OpenAI streaming response
+    after an error.
+
+    Once a StreamingResponse has started (HTTP 200 sent), raising an exception
+    is useless: the client is parsing SSE, not the HTTP status, and the ASGI
+    server raises "response already started". The stream must instead be closed
+    with a valid terminal sequence so the client stops waiting and does not
+    blindly retry a request that already produced a 200.
+
+    This produces three chunks:
+    1. A delta chunk carrying the error message as assistant content, so the
+       user sees why the response stopped instead of a silent empty reply.
+    2. A terminal chunk with finish_reason="stop" (OpenAI has no finish_reason
+       for "upstream error"; "stop" closes the turn without implying the
+       response should be resumed, unlike "length").
+    3. The data: [DONE] sentinel.
+
+    Args:
+        model: Model name to include in each chunk.
+        error_message: Human-readable error message shown to the user.
+
+    Returns:
+        List of SSE-formatted strings ("data: {...}\\n\\n", ending with [DONE]).
+    """
+    completion_id = generate_completion_id()
+    created_time = int(time.time())
+
+    error_content_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": f"[Error] {error_message}"},
+            "finish_reason": None,
+        }],
+    }
+    terminal_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+
+    return [
+        f"data: {json.dumps(error_content_chunk, ensure_ascii=False)}\n\n",
+        f"data: {json.dumps(terminal_chunk, ensure_ascii=False)}\n\n",
+        "data: [DONE]\n\n",
+    ]
 
 
 async def stream_kiro_to_openai_internal(
@@ -432,35 +493,13 @@ async def stream_kiro_to_openai_internal(
             f"Error during streaming: [{error_type}] {error_msg}",
             exc_info=True
         )
-        # If content was already streamed to the client, the OpenAI stream must
-        # still terminate with a finish_reason chunk. Without it, clients treat
-        # the stream as "ended without finish_reason" and blindly retry the whole
-        # request, even though partial content was already delivered. Emitting a
-        # terminal chunk lets the client close the stream cleanly.
-        #
-        # We use "stop" rather than "length": OpenAI's finish_reason has no value
-        # for "upstream connection broke mid-stream", and "length" would signal a
-        # token-limit truncation that invites continuation. "stop" terminates the
-        # stream without implying the response should be resumed. The underlying
-        # error is still logged server-side and propagated below.
-        #
-        # When no content was sent yet (first_chunk is True), we do NOT fabricate
-        # a terminal chunk: the error should propagate so normal error handling
-        # (HTTP error, first-token retry) applies instead of a fake empty success.
-        if not first_chunk:
-            error_finish_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            try:
-                yield f"data: {json.dumps(error_finish_chunk, ensure_ascii=False)}\n\n"
-            except Exception:
-                # Client already disconnected - nothing more we can send
-                pass
-        # Propagate error up for proper handling in routes_openai.py
+        # Propagate the error up. The OpenAI stream has no stateful blocks to
+        # close here, so the route layer (routes_openai.py stream_wrapper) owns
+        # terminating the SSE stream cleanly: it emits an error chunk, a terminal
+        # finish_reason chunk, and data: [DONE] in a single place. Centralizing
+        # termination in the route avoids duplicate finish_reason chunks and
+        # also covers errors raised outside this generator (e.g. first-token
+        # retry exhaustion raised by the core retry loop).
         raise
     finally:
         # Always close response
