@@ -98,6 +98,44 @@ def generate_thinking_signature() -> str:
     return f"sig_{uuid.uuid4().hex[:32]}"
 
 
+def build_error_termination_events(error_message: str) -> List[str]:
+    """
+    Build the SSE events that cleanly terminate an Anthropic streaming response
+    after an error.
+
+    Once a StreamingResponse has started (HTTP 200 sent), raising an exception is
+    useless: the client is parsing SSE events, not the HTTP status, and the ASGI
+    server raises "response already started". The stream must instead be closed
+    with the documented terminal events so the client stops waiting and does not
+    blindly retry a request that already produced a 200.
+
+    This produces two events:
+    1. An ``error`` event carrying the message (Anthropic's documented way to
+       report a mid-stream failure).
+    2. A ``message_stop`` event so clients that key off message_stop to finalize
+       the message also terminate cleanly.
+
+    Any still-open content blocks must be closed by the generator BEFORE these
+    events are emitted; this helper only produces the message-level terminators.
+
+    Args:
+        error_message: Human-readable error message shown to the user.
+
+    Returns:
+        List of Anthropic SSE-formatted strings.
+    """
+    return [
+        format_sse_event("error", {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": error_message,
+            },
+        }),
+        format_sse_event("message_stop", {"type": "message_stop"}),
+    ]
+
+
 def _extract_cache_usage_fields(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
     """
     Extract cache token fields from upstream usage (if present).
@@ -702,12 +740,19 @@ async def stream_kiro_to_anthropic(
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
         
-        # Close any content blocks that are still open before emitting the error.
-        # Anthropic clients track open content blocks and expect a matching
-        # content_block_stop for every content_block_start. If the upstream
-        # connection breaks mid-block, leaving a block unclosed makes the client
-        # treat the stream as incomplete and retry blindly, discarding content it
-        # already received. Closing open blocks lets the client finalize cleanly.
+        # Close any content blocks that are still open, then re-raise.
+        #
+        # Only the generator knows which content blocks are currently open, so
+        # closing them (a matching content_block_stop for every open
+        # content_block_start) must happen here. Anthropic clients track open
+        # blocks and treat an unclosed block as an incomplete stream, retrying
+        # blindly and discarding content they already received.
+        #
+        # The API-level terminal events (error + message_stop) are emitted once,
+        # centrally, by the route layer (routes_anthropic.py stream_wrapper).
+        # Centralizing them avoids duplicate error events and also covers errors
+        # raised outside this generator (e.g. first-token retry exhaustion raised
+        # by the core retry loop, which never enters this function).
         try:
             if thinking_block_started and thinking_block_index is not None:
                 yield format_sse_event("content_block_stop", {
@@ -721,15 +766,6 @@ async def stream_kiro_to_anthropic(
                     "index": text_block_index
                 })
                 text_block_started = False
-            
-            # Send error event (Anthropic's documented terminal event for errors)
-            yield format_sse_event("error", {
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": f"Internal error: {error_msg}"
-                }
-            })
         except Exception:
             # Client already disconnected - nothing more we can send
             pass

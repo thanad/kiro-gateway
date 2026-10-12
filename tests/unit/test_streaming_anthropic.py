@@ -915,10 +915,13 @@ class TestStreamingAnthropicErrorHandling:
         print("✓ GeneratorExit propagated correctly")
     
     @pytest.mark.asyncio
-    async def test_yields_error_event_on_exception(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_generator_reraises_without_emitting_error_event(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Yields error event on exception.
-        Goal: Verify error event is sent to client.
+        What it does: On a mid-stream error the generator re-raises WITHOUT
+            emitting the API-level error / message_stop events itself.
+        Goal: Those terminal events are owned by the route layer (so it can also
+            cover errors raised outside this generator). The generator's only
+            error responsibility is closing open content blocks (verified below).
         """
         print("Setup: Mock stream that raises RuntimeError...")
         
@@ -931,21 +934,18 @@ class TestStreamingAnthropicErrorHandling:
         
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                try:
+                with pytest.raises(RuntimeError):
                     async for event in stream_kiro_to_anthropic(
                         mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
                     ):
                         events.append(event)
-                except RuntimeError:
-                    pass
         
         print(f"Received {len(events)} events")
         
-        # Should have error event
-        error_events = [e for e in events if "event: error" in e]
-        assert len(error_events) >= 1
-        assert "Test error" in error_events[0]
-        print("✓ Error event yielded on exception")
+        # Generator must NOT emit the error event or message_stop (route's job)
+        assert all("event: error" not in e for e in events)
+        assert all("message_stop" not in e for e in events)
+        print("✓ Generator re-raises without emitting error/message_stop events")
     
     @pytest.mark.asyncio
     async def test_closes_response_in_finally(self, mock_response, mock_model_cache, mock_auth_manager):
@@ -975,13 +975,13 @@ class TestStreamingAnthropicErrorHandling:
         print("✓ Response closed in finally block")
     
     @pytest.mark.asyncio
-    async def test_closes_open_text_block_before_error_event(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_closes_open_text_block_before_reraising(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Closes an open text content block before emitting the error
-            event when an error occurs mid-stream.
+        What it does: Closes an open text content block (content_block_stop)
+            before re-raising when an error occurs mid-stream.
         Goal: Anthropic clients expect a content_block_stop for every open
-            content_block_start. Leaving a block unclosed makes the client treat
-            the stream as incomplete and retry blindly, discarding received content.
+            content_block_start. Closing the block is the generator's job; the
+            API-level error/message_stop events are added later by the route.
         """
         print("Setup: Mock stream that opens a text block then raises...")
         
@@ -994,30 +994,25 @@ class TestStreamingAnthropicErrorHandling:
         
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                try:
+                with pytest.raises(RuntimeError):
                     async for event in stream_kiro_to_anthropic(
                         mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
                     ):
                         events.append(event)
-                except RuntimeError:
-                    pass
         
         print(f"Received {len(events)} events")
         
-        # Find the index of content_block_stop and the error event
-        stop_indices = [i for i, e in enumerate(events) if "content_block_stop" in e]
-        error_indices = [i for i, e in enumerate(events) if "event: error" in e]
-        
-        assert len(stop_indices) >= 1, "Expected a content_block_stop before error"
-        assert len(error_indices) >= 1, "Expected an error event"
-        # content_block_stop must come BEFORE the error event
-        assert stop_indices[-1] < error_indices[0]
-        print("✓ Open text block closed before error event")
+        # The open text block must be closed; the generator must NOT emit the
+        # error event (route's responsibility).
+        stop_events = [e for e in events if "content_block_stop" in e]
+        assert len(stop_events) >= 1, "Expected a content_block_stop for the open text block"
+        assert all("event: error" not in e for e in events)
+        print("✓ Open text block closed before re-raising, no error event emitted")
     
     @pytest.mark.asyncio
-    async def test_closes_open_thinking_block_before_error_event(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_closes_open_thinking_block_before_reraising(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Closes an open thinking content block before the error event.
+        What it does: Closes an open thinking content block before re-raising.
         Goal: Verify thinking blocks are also finalized on mid-stream error so the
             client's block tracking stays consistent.
         """
@@ -1033,23 +1028,18 @@ class TestStreamingAnthropicErrorHandling:
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
                 with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
-                    try:
+                    with pytest.raises(RuntimeError):
                         async for event in stream_kiro_to_anthropic(
                             mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
                         ):
                             events.append(event)
-                    except RuntimeError:
-                        pass
         
         print(f"Received {len(events)} events")
         
-        stop_indices = [i for i, e in enumerate(events) if "content_block_stop" in e]
-        error_indices = [i for i, e in enumerate(events) if "event: error" in e]
-        
-        assert len(stop_indices) >= 1, "Expected a content_block_stop before error"
-        assert len(error_indices) >= 1, "Expected an error event"
-        assert stop_indices[-1] < error_indices[0]
-        print("✓ Open thinking block closed before error event")
+        stop_events = [e for e in events if "content_block_stop" in e]
+        assert len(stop_events) >= 1, "Expected a content_block_stop for the open thinking block"
+        assert all("event: error" not in e for e in events)
+        print("✓ Open thinking block closed before re-raising, no error event emitted")
     
     @pytest.mark.asyncio
     async def test_no_content_block_stop_when_no_block_open(self, mock_response, mock_model_cache, mock_auth_manager):
@@ -1070,22 +1060,62 @@ class TestStreamingAnthropicErrorHandling:
         
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                try:
+                with pytest.raises(RuntimeError):
                     async for event in stream_kiro_to_anthropic(
                         mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
                     ):
                         events.append(event)
-                except RuntimeError:
-                    pass
         
         print(f"Received {len(events)} events")
         
-        # Only message_start and error event should be present - no content_block_stop
+        # No block was open, so no content_block_stop should be emitted.
         content_block_stops = [e for e in events if "content_block_stop" in e]
-        error_events = [e for e in events if "event: error" in e]
         assert len(content_block_stops) == 0
-        assert len(error_events) >= 1
         print("✓ No stray content_block_stop emitted when no block was open")
+
+
+# ==================================================================================================
+# Tests for build_error_termination_events() helper (route-level stream termination)
+# ==================================================================================================
+
+class TestBuildErrorTerminationEvents:
+    """Tests for build_error_termination_events() - clean SSE termination on error."""
+    
+    def test_produces_error_and_message_stop(self):
+        """
+        What it does: Produces an error event followed by a message_stop event.
+        Goal: Verify the route can close a started Anthropic stream cleanly so the
+            client stops waiting and does not blindly retry a 200 response.
+        """
+        from kiro.streaming_anthropic import build_error_termination_events
+        
+        print("Action: Building error termination events...")
+        events = build_error_termination_events("boom")
+        
+        print(f"Produced {len(events)} events")
+        assert len(events) == 2
+        
+        # 1) error event carries the message
+        assert "event: error" in events[0]
+        assert "boom" in events[0]
+        assert '"type": "api_error"' in events[0]
+        
+        # 2) message_stop terminates the message
+        assert "event: message_stop" in events[1]
+        print("✓ Error event + message_stop produced in order")
+    
+    def test_error_message_is_included_verbatim(self):
+        """
+        What it does: Includes the provided message verbatim in the error event.
+        Goal: Users should see the actual reason the stream stopped.
+        """
+        from kiro.streaming_anthropic import build_error_termination_events
+        
+        print("Action: Building error termination events with a specific message...")
+        events = build_error_termination_events("Model did not respond within 60.0s")
+        
+        assert "Model did not respond within 60.0s" in events[0]
+        print("✓ Error message included verbatim")
 
 
 # ==================================================================================================

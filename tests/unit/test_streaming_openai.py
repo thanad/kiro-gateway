@@ -1236,12 +1236,13 @@ class TestStreamingOpenaiErrorHandling:
         print("✓ Original error not masked by aclose error")
     
     @pytest.mark.asyncio
-    async def test_emits_finish_reason_chunk_on_error_after_content(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_generator_reraises_without_emitting_terminal_chunk(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Emits a terminal finish_reason chunk before raising when
-            an error occurs after content was already streamed.
-        Goal: Prevent clients from seeing "stream ended without finish_reason"
-            and blindly retrying when partial content was already delivered.
+        What it does: On a mid-stream error the generator re-raises WITHOUT
+            fabricating a terminal finish_reason chunk itself.
+        Goal: Terminating the SSE stream is owned by the route layer (so it can
+            also cover errors raised outside this generator, like first-token
+            retry exhaustion). The generator must only propagate the error.
         """
         print("Setup: Mock stream that yields content then raises mid-stream...")
         
@@ -1263,80 +1264,80 @@ class TestStreamingOpenaiErrorHandling:
         
         print(f"Received {len(chunks)} chunks before error propagated")
         
-        # Last chunk before the exception must be a terminal finish_reason chunk
-        assert len(chunks) >= 2  # content chunk + terminal chunk
-        terminal_chunk = chunks[-1]
-        assert terminal_chunk.startswith("data: ")
-        data = json.loads(terminal_chunk[len("data: "):].strip())
-        assert data["choices"][0]["finish_reason"] == "stop"
-        assert data["choices"][0]["delta"] == {}
-        print("✓ Terminal finish_reason chunk emitted on mid-stream error")
+        # Only the content chunk should have been emitted - no terminal chunk and
+        # no [DONE] from the generator (that is the route's responsibility now).
+        assert all("finish_reason\": \"stop\"" not in c for c in chunks)
+        assert all(c != "data: [DONE]\n\n" for c in chunks)
+        print("✓ Generator re-raises without emitting a terminal chunk")
+
+
+# ==================================================================================================
+# Tests for build_error_termination_chunks() helper (route-level stream termination)
+# ==================================================================================================
+
+class TestBuildErrorTerminationChunks:
+    """Tests for build_error_termination_chunks() - clean SSE termination on error."""
     
-    @pytest.mark.asyncio
-    async def test_no_finish_reason_chunk_when_error_before_content(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+    def test_produces_error_content_terminal_and_done(self):
         """
-        What it does: Does NOT fabricate a terminal chunk when the error happens
-            before any content was streamed.
-        Goal: Errors before first token must propagate cleanly so normal error
-            handling (HTTP error, first-token retry) applies, not a fake success.
+        What it does: Produces an error content chunk, a finish_reason terminal
+            chunk, and the [DONE] sentinel, in that order.
+        Goal: Verify the route can close a started stream cleanly so the client
+            stops waiting and does not blindly retry a 200 response.
         """
-        print("Setup: Mock stream that raises before yielding any content...")
+        from kiro.streaming_openai import build_error_termination_chunks
         
-        async def mock_parse_kiro_stream(*args, **kwargs):
-            raise RuntimeError("Failed before first token")
-            yield  # Make it a generator
+        print("Action: Building error termination chunks...")
+        chunks = build_error_termination_chunks("claude-sonnet-4", "boom")
         
-        print("Action: Streaming and collecting chunks until error...")
-        chunks = []
+        print(f"Produced {len(chunks)} chunks")
+        assert len(chunks) == 3
         
-        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
-            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
-                with pytest.raises(RuntimeError):
-                    async for chunk in stream_kiro_to_openai(
-                        mock_http_client, mock_response, "claude-sonnet-4",
-                        mock_model_cache, mock_auth_manager
-                    ):
-                        chunks.append(chunk)
+        # 1) error content chunk carries the message to the user
+        content_data = json.loads(chunks[0][len("data: "):].strip())
+        assert content_data["choices"][0]["delta"]["content"] == "[Error] boom"
+        assert content_data["choices"][0]["delta"]["role"] == "assistant"
+        assert content_data["choices"][0]["finish_reason"] is None
         
-        print(f"Received {len(chunks)} chunks before error propagated")
+        # 2) terminal chunk closes the turn with finish_reason="stop"
+        terminal_data = json.loads(chunks[1][len("data: "):].strip())
+        assert terminal_data["choices"][0]["finish_reason"] == "stop"
+        assert terminal_data["choices"][0]["delta"] == {}
         
-        # No chunks at all should have been emitted - no fabricated terminal chunk
-        assert chunks == []
-        print("✓ No terminal chunk fabricated when error precedes first token")
+        # 3) [DONE] sentinel
+        assert chunks[2] == "data: [DONE]\n\n"
+        print("✓ Error chunk + terminal chunk + [DONE] produced in order")
     
-    @pytest.mark.asyncio
-    async def test_finish_reason_chunk_also_emitted_after_thinking(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+    def test_includes_model_name(self):
         """
-        What it does: Emits terminal finish_reason chunk when error occurs after
-            only thinking content was streamed (no regular content yet).
-        Goal: Thinking content also sets first_chunk=False, so the terminal chunk
-            must be emitted to close the stream cleanly.
+        What it does: Includes the model name in the emitted chunks.
+        Goal: Verify OpenAI chunk shape is preserved on the error path.
         """
-        print("Setup: Mock stream that yields thinking then raises...")
+        from kiro.streaming_openai import build_error_termination_chunks
         
-        async def mock_parse_kiro_stream(*args, **kwargs):
-            yield KiroEvent(type="thinking", thinking_content="Reasoning...")
-            raise RuntimeError("Broke after thinking")
+        print("Action: Building error termination chunks with model name...")
+        chunks = build_error_termination_chunks("gpt-5.6", "oops")
         
-        print("Action: Streaming and collecting chunks until error...")
-        chunks = []
+        content_data = json.loads(chunks[0][len("data: "):].strip())
+        assert content_data["model"] == "gpt-5.6"
+        print("✓ Model name included in error chunks")
+    
+    def test_shares_completion_id_across_chunks(self):
+        """
+        What it does: Uses the same completion id for the error and terminal chunks.
+        Goal: Clients correlate chunks of one response by id; the error and its
+            terminator must share the same id.
+        """
+        from kiro.streaming_openai import build_error_termination_chunks
         
-        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
-            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
-                with patch('kiro.streaming_openai.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
-                    with pytest.raises(RuntimeError):
-                        async for chunk in stream_kiro_to_openai(
-                            mock_http_client, mock_response, "claude-sonnet-4",
-                            mock_model_cache, mock_auth_manager
-                        ):
-                            chunks.append(chunk)
+        print("Action: Building error termination chunks...")
+        chunks = build_error_termination_chunks("claude-sonnet-4", "err")
         
-        print(f"Received {len(chunks)} chunks before error propagated")
-        
-        terminal_chunk = chunks[-1]
-        data = json.loads(terminal_chunk[len("data: "):].strip())
-        assert data["choices"][0]["finish_reason"] == "stop"
-        print("✓ Terminal chunk emitted after thinking-only content")
+        content_data = json.loads(chunks[0][len("data: "):].strip())
+        terminal_data = json.loads(chunks[1][len("data: "):].strip())
+        assert content_data["id"] == terminal_data["id"]
+        assert content_data["id"].startswith("chatcmpl-")
+        print("✓ Error and terminal chunks share one completion id")
 
 
 # ==================================================================================================
