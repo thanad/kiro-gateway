@@ -360,12 +360,13 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # If the model doesn't respond within this time, the request will be cancelled and retried.
 # This helps handle "stuck" requests when the model takes too long to think.
 #
-# Default: 60 seconds. Extended thinking models (fake reasoning) buffer their
+# Default: 120 seconds. Extended thinking models (fake reasoning) buffer their
 # reasoning before emitting the first token, which regularly exceeds a short
 # timeout and triggers spurious retries that end with a 504 and a stream that
-# closes without a finish_reason. 60s gives thinking models room to start.
+# closes without a finish_reason. Observed first-token latency for thinking
+# models can run well past 60s, so 120s is used to avoid premature retries.
 # Set a lower value (e.g., 10-15) for more aggressive retry on non-thinking models.
-FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "60"))
+FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "120"))
 
 # Read timeout for streaming responses (in seconds).
 # This is the maximum time to wait for data between chunks during streaming.
