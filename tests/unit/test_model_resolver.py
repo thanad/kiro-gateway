@@ -434,8 +434,12 @@ class TestNormalizeModelNameParametrized:
         ("claude-sonnet-5", "claude-sonnet-5"),
         ("claude-sonnet-5-20260101", "claude-sonnet-5"),
         ("claude-sonnet-5.5", "claude-sonnet-5.5"),
+        ("claude-sonnet-5-5", "claude-sonnet-5.5"),             # Dash → Dot
+        ("claude-sonnet-5-5-20260401", "claude-sonnet-5.5"),   # Dash → Dot + date stripped
         ("claude-opus-5", "claude-opus-5"),
         ("claude-opus-5-20260215", "claude-opus-5"),
+        ("claude-opus-5.5", "claude-opus-5.5"),
+        ("claude-opus-5-5", "claude-opus-5.5"),                 # Dash → Dot
         ("claude-opus-4.8", "claude-opus-4.8"),
         ("claude-opus-4-8", "claude-opus-4.8"),
         ("claude-opus-4-8-20260301", "claude-opus-4.8"),
@@ -844,8 +848,10 @@ class TestNewFallbackModelsResolution:
 
     @pytest.mark.parametrize("model_id", [
         "claude-sonnet-5",
+        "claude-sonnet-5.5",
         "claude-opus-4.8",
         "claude-opus-5",
+        "claude-opus-5.5",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -870,6 +876,8 @@ class TestNewFallbackModelsResolution:
 
     @pytest.mark.parametrize("input_model,expected_id", [
         ("claude-sonnet-5-20260101", "claude-sonnet-5"),   # Date suffix stripped
+        ("claude-sonnet-5-5", "claude-sonnet-5.5"),        # Dash → Dot
+        ("claude-opus-5-5", "claude-opus-5.5"),            # Dash → Dot
         ("claude-opus-4-8", "claude-opus-4.8"),            # Dash → Dot
         ("claude-opus-4-8-20260301", "claude-opus-4.8"),   # Dash → Dot + date stripped
     ])
@@ -900,8 +908,10 @@ class TestNewFallbackModelsResolution:
 
         for model_id in (
             "claude-sonnet-5",
+            "claude-sonnet-5.5",
             "claude-opus-4.8",
             "claude-opus-5",
+            "claude-opus-5.5",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -940,6 +950,53 @@ class TestNewFallbackModelsResolution:
 
         print(f"Comparing is_verified: Expected False, Got {result.is_verified}")
         assert result.is_verified is False
+
+    @pytest.mark.parametrize("model_id", [
+        "claude-opus-5.5",
+        "claude-sonnet-5.5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-opus-4.8",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "claude-opus-4.7",
+        "claude-opus-4.6",
+        "claude-sonnet-4.6",
+    ])
+    def test_1m_context_models_report_extended_token_limit(self, fallback_cache, model_id):
+        """
+        What it does: Checks that 1M-context fallback models expose maxInputTokens == 1M.
+        Goal: Verify tokenLimits from FALLBACK_MODELS flow through the cache so that
+              context-window-aware logic (e.g., truncation) sees the extended limit.
+        """
+        from kiro.config import CONTEXT_WINDOW_1M
+
+        print(f"Action: Getting max input tokens for '{model_id}'...")
+        max_tokens = fallback_cache.get_max_input_tokens(model_id)
+
+        print(f"Comparing: Expected {CONTEXT_WINDOW_1M}, Got {max_tokens}")
+        assert max_tokens == CONTEXT_WINDOW_1M
+
+    @pytest.mark.parametrize("model_id", [
+        "claude-opus-4.5",
+        "claude-sonnet-4.5",
+        "claude-haiku-4.5",
+        "deepseek-3.2",
+        "glm-5",
+    ])
+    def test_non_1m_models_fall_back_to_default_token_limit(self, fallback_cache, model_id):
+        """
+        What it does: Checks that models without tokenLimits use DEFAULT_MAX_INPUT_TOKENS.
+        Goal: Verify the cache default applies when FALLBACK_MODELS omits tokenLimits.
+        """
+        from kiro.config import DEFAULT_MAX_INPUT_TOKENS
+
+        print(f"Action: Getting max input tokens for '{model_id}'...")
+        max_tokens = fallback_cache.get_max_input_tokens(model_id)
+
+        print(f"Comparing: Expected {DEFAULT_MAX_INPUT_TOKENS}, Got {max_tokens}")
+        assert max_tokens == DEFAULT_MAX_INPUT_TOKENS
 
 
 class TestModelResolverGetAvailableModels:

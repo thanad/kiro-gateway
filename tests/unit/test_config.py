@@ -587,8 +587,9 @@ class TestFallbackModelsConfig:
     def test_fallback_models_contain_claude_5_generation(self):
         """
         What it does: Verifies that fallback models include Claude 5 generation models.
-        Purpose: Ensure newly released models (claude-sonnet-5, claude-opus-4.8,
-                 claude-opus-5) are available when /ListAvailableModels is unreachable.
+        Purpose: Ensure newly released models (claude-sonnet-5, claude-sonnet-5.5,
+                 claude-opus-4.8, claude-opus-5, claude-opus-5.5) are available when
+                 /ListAvailableModels is unreachable.
         """
         print("Setup: Importing FALLBACK_MODELS...")
         from kiro.config import FALLBACK_MODELS
@@ -598,12 +599,31 @@ class TestFallbackModelsConfig:
 
         expected_claude_5_models = {
             "claude-sonnet-5",
+            "claude-sonnet-5.5",
             "claude-opus-4.8",
             "claude-opus-5",
+            "claude-opus-5.5",
         }
         for model_id in expected_claude_5_models:
             print(f"Verification: Contains '{model_id}'...")
             assert model_id in model_ids, f"Missing expected Claude 5 generation model: {model_id}"
+
+    def test_fallback_models_exclude_retired_models(self):
+        """
+        What it does: Verifies that retired models are NOT in the fallback list.
+        Purpose: Lock in the removal of claude-sonnet-4, which was dropped from the
+                 upstream model catalog. Prevents accidental re-introduction.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = {m["modelId"] for m in FALLBACK_MODELS}
+        print(f"Model IDs in fallback list: {sorted(model_ids)}")
+
+        retired_models = {"claude-sonnet-4"}
+        for model_id in retired_models:
+            print(f"Verification: Does NOT contain '{model_id}'...")
+            assert model_id not in model_ids, f"Retired model should not be in fallback list: {model_id}"
 
     def test_fallback_models_contain_gpt_models(self):
         """
@@ -654,7 +674,55 @@ class TestFallbackModelsConfig:
             model_id = model["modelId"]
             print(f"Checking: {model_id} is lowercase...")
             assert model_id == model_id.lower(), f"Model ID '{model_id}' is not lowercase"
-    
+
+    def test_fallback_models_1m_context_token_limits(self):
+        """
+        What it does: Verifies that 1M-context models carry the expected
+                      tokenLimits.maxInputTokens, and other models carry none.
+        Purpose: Ensure the extended context window is advertised correctly via
+                 FALLBACK_MODELS, matching the upstream model catalog. Models
+                 without tokenLimits fall back to DEFAULT_MAX_INPUT_TOKENS.
+        """
+        print("Setup: Importing FALLBACK_MODELS and CONTEXT_WINDOW_1M...")
+        from kiro.config import FALLBACK_MODELS, CONTEXT_WINDOW_1M
+
+        print(f"CONTEXT_WINDOW_1M = {CONTEXT_WINDOW_1M}")
+        assert CONTEXT_WINDOW_1M == 1_000_000
+
+        expected_1m_models = {
+            "claude-opus-5.5",
+            "claude-sonnet-5.5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4.8",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "claude-opus-4.7",
+            "claude-opus-4.6",
+            "claude-sonnet-4.6",
+        }
+
+        models_by_id = {m["modelId"]: m for m in FALLBACK_MODELS}
+
+        print("Action: Verifying 1M models expose maxInputTokens == CONTEXT_WINDOW_1M...")
+        for model_id in expected_1m_models:
+            model = models_by_id[model_id]
+            print(f"Checking 1M model: {model_id} -> {model.get('tokenLimits')}")
+            assert "tokenLimits" in model, f"{model_id} missing tokenLimits"
+            assert model["tokenLimits"].get("maxInputTokens") == CONTEXT_WINDOW_1M, (
+                f"{model_id} should advertise {CONTEXT_WINDOW_1M} input tokens"
+            )
+
+        print("Action: Verifying non-1M models do NOT declare tokenLimits...")
+        for model_id, model in models_by_id.items():
+            if model_id in expected_1m_models:
+                continue
+            print(f"Checking non-1M model: {model_id} -> {model.get('tokenLimits')}")
+            assert "tokenLimits" not in model, (
+                f"{model_id} should not declare tokenLimits (defaults applied)"
+            )
+
     def test_fallback_models_use_dot_format(self):
         """
         What it does: Verifies that model IDs use dot format (e.g., claude-4.5).
